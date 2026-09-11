@@ -55,6 +55,17 @@ def health_all():
  for t in ts:t.start()
  for t in ts:t.join()
  good=sum(p['status']=='healthy' for p in items); log('success',f'اكتمل الفحص: {good}/{len(items)} بروكسي متاح')
+def run_task(task):
+ with db() as c: c.execute('UPDATE tasks SET status="running",runs=runs+1 WHERE id=?',(task['id'],))
+ load(); log('info',f"بدأ تنفيذ المهمة: {task['name']}")
+ started=time.perf_counter(); ok=False
+ try:
+  # Safe, bounded connectivity check; browser actions remain explicit and are not automated here.
+  req=urllib.request.Request(task['url'],headers={'User-Agent':'CPA-Control-Center/1.0'})
+  with urllib.request.urlopen(req,timeout=float(state['settings']['timeout'])) as r: ok=200 <= r.status < 400
+ except Exception as e: log('error',f"فشلت المهمة {task['name']}: {type(e).__name__}")
+ with db() as c:c.execute('UPDATE tasks SET status=?,successes=successes+? WHERE id=?',('success' if ok else 'failed',1 if ok else 0,task['id']))
+ load(); log('success' if ok else 'error',f"انتهت المهمة: {task['name']} ({round((time.perf_counter()-started)*1000)} ms)")
 def send(h,code,payload):
  body=json.dumps(payload,ensure_ascii=False).encode(); h.send_response(code); h.send_header('Content-Type','application/json; charset=utf-8'); h.send_header('Content-Length',str(len(body))); h.send_header('Access-Control-Allow-Origin','*'); h.end_headers(); h.wfile.write(body)
 class API(BaseHTTPRequestHandler):
@@ -100,6 +111,13 @@ class API(BaseHTTPRequestHandler):
   if path=='/api/tasks/toggle':
    with db() as c:c.execute('UPDATE tasks SET enabled=1-enabled WHERE id=?',(data.get('id'),))
    load(); return send(self,200,state['tasks'])
+  if path=='/api/tasks/delete':
+   with db() as c:c.execute('DELETE FROM tasks WHERE id=?',(data.get('id'),))
+   load(); log('info','تم حذف المهمة'); return send(self,200,state['tasks'])
+  if path=='/api/tasks/run':
+   task=next((t for t in state['tasks'] if t.get('id')==data.get('id')),None)
+   if not task or not task.get('url','').startswith(('http://','https://')): return send(self,400,{'error':'رابط المهمة غير صالح'})
+   threading.Thread(target=run_task,args=(task,),daemon=True).start(); return send(self,202,{'started':True})
   if path=='/api/settings':
    with LOCK:
     for k,v in data.items():
