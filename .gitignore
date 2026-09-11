@@ -3,5 +3,6 @@ dist/
 release/
 __pycache__/
 *.pyc
+backend/*.sqlite3
 .env
 .DS_Store
