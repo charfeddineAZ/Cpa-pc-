@@ -10,19 +10,21 @@ def db():
  c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
 def init_db():
  with db() as c:
-  c.execute('CREATE TABLE IF NOT EXISTS proxies (id INTEGER PRIMARY KEY, raw TEXT UNIQUE, url TEXT, host TEXT, port INTEGER, scheme TEXT, username TEXT, status TEXT, latency INTEGER, failures INTEGER DEFAULT 0, successes INTEGER DEFAULT 0, cooldown REAL DEFAULT 0, last_check REAL)')
+  c.execute('CREATE TABLE IF NOT EXISTS proxies (id INTEGER PRIMARY KEY, raw TEXT UNIQUE, url TEXT, host TEXT, port INTEGER, scheme TEXT, username TEXT, status TEXT, latency INTEGER, score REAL DEFAULT 0, failures INTEGER DEFAULT 0, successes INTEGER DEFAULT 0, cooldown REAL DEFAULT 0, last_check REAL)')
+  try: c.execute('ALTER TABLE proxies ADD COLUMN score REAL DEFAULT 0')
+  except sqlite3.OperationalError: pass
   c.execute('CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, name TEXT, url TEXT, enabled INTEGER DEFAULT 1, status TEXT DEFAULT "idle", runs INTEGER DEFAULT 0, successes INTEGER DEFAULT 0, created REAL)')
   c.execute('CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, time TEXT, level TEXT, message TEXT)')
   c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
   c.commit()
 def load():
  with db() as c:
-  state['proxies']=[dict(x) for x in c.execute('SELECT * FROM proxies ORDER BY status="healthy" DESC, latency IS NULL, latency ASC')]
+  state['proxies']=[dict(x) for x in c.execute('SELECT * FROM proxies ORDER BY score DESC, status="healthy" DESC, latency IS NULL, latency ASC')]
   state['tasks']=[dict(x) for x in c.execute('SELECT * FROM tasks ORDER BY id DESC')]
   state['logs']=[dict(x) for x in c.execute('SELECT time,level,message FROM logs ORDER BY id DESC LIMIT 100')]
   for k,v in c.execute('SELECT key,value FROM settings'): state['settings'][k]=json.loads(v)
 def persist_proxy(p):
- with db() as c: c.execute('INSERT OR REPLACE INTO proxies(id,raw,url,host,port,scheme,username,status,latency,failures,successes,cooldown,last_check) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(p.get('id'),p['raw'],p['url'],p['host'],p['port'],p['scheme'],p.get('username'),p['status'],p.get('latency'),p.get('failures',0),p.get('successes',0),p.get('cooldown',0),p.get('last_check')))
+ with db() as c: c.execute('INSERT OR REPLACE INTO proxies(id,raw,url,host,port,scheme,username,status,latency,score,failures,successes,cooldown,last_check) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(p.get('id'),p['raw'],p['url'],p['host'],p['port'],p['scheme'],p.get('username'),p['status'],p.get('latency'),p.get('score',0),p.get('failures',0),p.get('successes',0),p.get('cooldown',0),p.get('last_check')))
 def log(level,message):
  item={"time":time.strftime('%H:%M:%S'),"level":level,"message":message}
  with LOCK:
@@ -40,8 +42,11 @@ def check_proxy(p):
   opener=urllib.request.build_opener(urllib.request.ProxyHandler({'http':p['url'],'https':p['url']}))
   with opener.open(req,timeout=float(state['settings']['timeout'])): pass
   p.update(status='healthy',latency=round((time.perf_counter()-started)*1000),failures=0,last_check=now); p['successes']+=1
+  # score rewards reliability and low latency; it is intentionally bounded 0..100
+  reliability=p['successes']/max(1,p['successes']+p['failures']); speed=max(0,100-min(100,p['latency']/10))
+  p['score']=round(reliability*70+speed*0.30,1)
  except Exception:
-  p.update(status='offline',latency=None,failures=p.get('failures',0)+1,last_check=now); p['cooldown']=now+min(300,2**p['failures'])
+  p.update(status='offline',latency=None,failures=p.get('failures',0)+1,last_check=now); p['cooldown']=now+min(300,2**p['failures']); p['score']=round(max(0,p.get('score',0)-15),1)
  with LOCK: persist_proxy(p)
  return p['status']=='healthy'
 def health_all():
