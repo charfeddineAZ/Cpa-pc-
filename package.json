@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "test:build": "npm run build && python3 -m py_compile backend/main.py",
+    "test:api": "python3 tests/smoke_api.py",
     "electron": "electron .",
     "build": "vite build",
     "start": "concurrently -k \"python backend/main.py\" \"vite --host 0.0.0.0\"",
