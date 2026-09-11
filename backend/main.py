@@ -2,7 +2,7 @@
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import json, time, threading, sqlite3, os, urllib.request
 from urllib.parse import urlparse
-DB=os.path.join(os.path.dirname(__file__),'cpa.sqlite3'); LOCK=threading.RLock()
+DB=os.path.join(os.path.dirname(__file__),'cpa.sqlite3'); LOCK=threading.RLock(); MAX_BODY=1024*1024
 DEFAULT={"running":False,"started_at":None,"requests":0,"success":0,"failed":0,"logs":[],"proxies":[],"tasks":[],"settings":{"rotation":"smart","timeout":8,"retries":2,"verify":True}}
 state=json.loads(json.dumps(DEFAULT))
 
@@ -31,9 +31,14 @@ def log(level,message):
   state['logs'].insert(0,item); state['logs']=state['logs'][:100]
   with db() as c: c.execute('INSERT INTO logs(time,level,message) VALUES(?,?,?)',(item['time'],level,message)); c.execute('DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT 100)')
 def parse_proxy(raw):
- raw=raw.strip(); candidate=raw if '://' in raw else 'http://'+raw; u=urlparse(candidate)
- if u.scheme not in ('http','https','socks5') or not u.hostname or not u.port: raise ValueError('يجب استخدام scheme://host:port صحيح')
- return {'raw':raw,'url':candidate,'host':u.hostname,'port':u.port,'scheme':u.scheme,'username':u.username,'status':'untested','latency':None,'failures':0,'successes':0,'cooldown':0,'last_check':None}
+ if not isinstance(raw,str): raise ValueError('صيغة البروكسي غير صالحة')
+ raw=raw.strip()
+ if len(raw)>512: raise ValueError('عنوان البروكسي طويل جداً')
+ candidate=raw if '://' in raw else 'http://'+raw
+ try: u=urlparse(candidate); port=u.port
+ except ValueError: raise ValueError('المنفذ يجب أن يكون رقماً بين 1 و65535')
+ if u.scheme not in ('http','https','socks5') or not u.hostname or not port or not (1<=port<=65535): raise ValueError('يجب استخدام scheme://host:port صحيح')
+ return {'raw':raw,'url':candidate,'host':u.hostname,'port':port,'scheme':u.scheme,'username':u.username,'status':'untested','latency':None,'failures':0,'successes':0,'cooldown':0,'last_check':None}
 def check_proxy(p):
  started=time.perf_counter(); now=time.time()
  try:
@@ -67,7 +72,17 @@ def run_task(task):
  with db() as c:c.execute('UPDATE tasks SET status=?,successes=successes+? WHERE id=?',('success' if ok else 'failed',1 if ok else 0,task['id']))
  load(); log('success' if ok else 'error',f"انتهت المهمة: {task['name']} ({round((time.perf_counter()-started)*1000)} ms)")
 def send(h,code,payload):
- body=json.dumps(payload,ensure_ascii=False).encode(); h.send_response(code); h.send_header('Content-Type','application/json; charset=utf-8'); h.send_header('Content-Length',str(len(body))); h.send_header('Access-Control-Allow-Origin','*'); h.end_headers(); h.wfile.write(body)
+ body=json.dumps(payload,ensure_ascii=False).encode(); h.send_response(code); h.send_header('Content-Type','application/json; charset=utf-8'); h.send_header('Content-Length',str(len(body))); h.send_header('Cache-Control','no-store'); h.send_header('X-Content-Type-Options','nosniff'); h.send_header('Access-Control-Allow-Origin','*'); h.end_headers();
+ if code!=204: h.wfile.write(body)
+def read_json(h):
+ try: length=int(h.headers.get('Content-Length','0'))
+ except ValueError: raise ValueError('invalid content length')
+ if length<0 or length>MAX_BODY: raise ValueError('request body too large')
+ raw=h.rfile.read(length) if length else b'{}'
+ try: data=json.loads(raw or b'{}')
+ except json.JSONDecodeError: raise ValueError('invalid json')
+ if not isinstance(data,dict): raise ValueError('json object required')
+ return data
 class API(BaseHTTPRequestHandler):
  def log_message(self,*a): pass
  def do_OPTIONS(self): send(self,204,{})
@@ -81,13 +96,16 @@ class API(BaseHTTPRequestHandler):
   send(self,404,{'error':'not found'})
  def do_POST(self):
   path=urlparse(self.path).path
-  try:data=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0))) or b'{}')
-  except:return send(self,400,{'error':'invalid json'})
+  try:data=read_json(self)
+  except ValueError as e:return send(self,400,{'error':str(e)})
   if path=='/api/proxies/import':
    added=0; errors=[]
+   text=data.get('text','')
+   if not isinstance(text,str): return send(self,400,{'error':'text must be a string'})
+   if len(text)>MAX_BODY: return send(self,413,{'error':'proxy list is too large'})
    with LOCK:
     existing={p['raw'] for p in state['proxies']}
-    for raw in data.get('text','').replace(',','\n').splitlines():
+    for raw in text.replace(',','\n').splitlines():
      try:
       p=parse_proxy(raw)
       if p['raw'] not in existing: persist_proxy(p); state['proxies'].append(p); existing.add(p['raw']); added+=1
@@ -105,7 +123,10 @@ class API(BaseHTTPRequestHandler):
     with db() as c:c.execute('DELETE FROM proxies WHERE id=?',(data.get('id'),))
    return send(self,200,{'ok':True})
   if path=='/api/tasks/create':
-   task={'name':data.get('name','مهمة جديدة'),'url':data.get('url',''),'enabled':1,'status':'idle','runs':0,'successes':0,'created':time.time()}
+   name=data.get('name','مهمة جديدة'); url=data.get('url','')
+   if not isinstance(name,str) or not name.strip() or len(name)>120: return send(self,400,{'error':'اسم المهمة مطلوب (حتى 120 حرفاً)'})
+   if not isinstance(url,str) or not url.startswith(('http://','https://')) or len(url)>2048: return send(self,400,{'error':'يجب إدخال رابط HTTP أو HTTPS صالح'})
+   task={'name':name.strip(),'url':url.strip(),'enabled':1,'status':'idle','runs':0,'successes':0,'created':time.time()}
    with db() as c: cur=c.execute('INSERT INTO tasks(name,url,enabled,status,runs,successes,created) VALUES(?,?,?,?,?,?,?)',(task['name'],task['url'],1,'idle',0,0,task['created'])); task['id']=cur.lastrowid
    state['tasks'].insert(0,task); log('info',f"تم إنشاء المهمة: {task['name']}"); return send(self,200,task)
   if path=='/api/tasks/toggle':
@@ -119,6 +140,10 @@ class API(BaseHTTPRequestHandler):
    if not task or not task.get('url','').startswith(('http://','https://')): return send(self,400,{'error':'رابط المهمة غير صالح'})
    threading.Thread(target=run_task,args=(task,),daemon=True).start(); return send(self,202,{'started':True})
   if path=='/api/settings':
+   allowed={'rotation':('smart','round_robin','random')}
+   if 'rotation' in data and data['rotation'] not in allowed['rotation']: return send(self,400,{'error':'استراتيجية تدوير غير صالحة'})
+   if 'timeout' in data and (not isinstance(data['timeout'],(int,float)) or not 1<=data['timeout']<=120): return send(self,400,{'error':'المهلة يجب أن تكون بين 1 و120 ثانية'})
+   if 'retries' in data and (not isinstance(data['retries'],(int,float)) or not 0<=data['retries']<=10): return send(self,400,{'error':'عدد المحاولات يجب أن يكون بين 0 و10'})
    with LOCK:
     for k,v in data.items():
      if k in state['settings']: state['settings'][k]=v
