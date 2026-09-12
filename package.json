@@ -1,6 +1,8 @@
 {
   "name": "cpa-desktop",
   "version": "1.0.0",
+  "author": "CPA Control Center",
+  "desktopName": "cpa-control-center",
   "description": "Professional CPA automation desktop control center",
   "main": "electron/main.js",
   "type": "module",
@@ -15,5 +17,5 @@
   },
   "dependencies": { "@vitejs/plugin-react": "latest", "vite": "latest", "react": "latest", "react-dom": "latest", "lucide-react": "latest" },
   "devDependencies": { "electron": "latest", "electron-builder": "latest", "concurrently": "latest" },
-  "build": { "appId": "com.cpa.desktop", "productName": "CPA Control Center", "files": ["dist/**/*", "electron/**/*", "backend/**/*"], "directories": { "output": "release" } }
+  "build": { "appId": "com.cpa.desktop", "productName": "CPA Control Center", "files": ["dist/**/*", "electron/**/*", "backend/**/*"], "directories": { "output": "release" }, "linux": { "category": "Utility" } }
 }
