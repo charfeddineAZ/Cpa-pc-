@@ -12,6 +12,12 @@ state=call('/api/state')
 assert state['proxies'][0]['id']
 settings=call('/api/settings', {'retries': 3, 'verify': False, 'rotation': 'round_robin'})
 assert settings['retries'] == 3 and settings['verify'] is False
+assert settings['webrtc_protection'] is True
+assert call('/api/settings', {'webrtc_protection': False})['webrtc_protection'] is False
+assert call('/api/settings', {'webrtc_mode': 'proxy_only'})['webrtc_mode'] == 'proxy_only'
+ip_task=call('/api/tasks/create-ip-check', {})
+assert ip_task['url'] == 'https://browserleaks.com/ip'
+assert call('/api/tasks/create-ip-check', {})['id'] == ip_task['id']
 task=call('/api/tasks/create', {'name':'Smoke test','url':'https://example.com'})
 assert task['id']
 call('/api/tasks/toggle', {'id':task['id']})

@@ -3,9 +3,11 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import json, time, threading, sqlite3, os, random, ssl, urllib.request
 from urllib.parse import urlparse
 DB=os.environ.get('CPA_DB_PATH',os.path.join(os.path.dirname(__file__),'cpa.sqlite3'))
+IP_CHECK_URL='https://browserleaks.com/ip'
+PROXY_TEST_URL=os.environ.get('CPA_PROXY_TEST_URL',IP_CHECK_URL)
 os.makedirs(os.path.dirname(os.path.abspath(DB)),exist_ok=True)
 LOCK=threading.RLock(); TASK_LOCK=threading.Lock(); CHECK_LOCK=threading.Lock(); MAX_BODY=1024*1024
-DEFAULT={"running":False,"started_at":None,"requests":0,"success":0,"failed":0,"logs":[],"proxies":[],"tasks":[],"settings":{"rotation":"smart","timeout":8,"retries":2,"verify":True},"stats":{"avg_latency":None,"active_tasks":0}}
+DEFAULT={"running":False,"started_at":None,"requests":0,"success":0,"failed":0,"logs":[],"proxies":[],"tasks":[],"settings":{"rotation":"smart","timeout":8,"retries":2,"verify":True,"webrtc_protection":True,"webrtc_mode":"blocked"},"stats":{"avg_latency":None,"active_tasks":0}}
 rotation_cursor=0
 state=json.loads(json.dumps(DEFAULT))
 
@@ -58,8 +60,11 @@ def check_proxy(p):
  started=time.perf_counter(); now=time.time()
  try:
   if p['scheme']=='socks5': raise RuntimeError('SOCKS5 adapter غير مثبت')
-  req=urllib.request.Request('https://www.gstatic.com/generate_204',headers={'User-Agent':'CPA-Control-Center/1.0'})
-  with opener_for(p).open(req,timeout=float(state['settings']['timeout'])): pass
+  # This endpoint reports the egress IP, so a successful response verifies that
+  # requests are actually leaving through the selected proxy.
+  req=urllib.request.Request(PROXY_TEST_URL,headers={'User-Agent':'CPA-Control-Center/1.0'})
+  with opener_for(p).open(req,timeout=float(state['settings']['timeout'])) as response:
+   if not 200 <= response.status < 400: raise RuntimeError(f'فشل فحص عنوان IP (HTTP {response.status})')
   p.update(status='healthy',latency=round((time.perf_counter()-started)*1000),failures=0,last_check=now); p['successes']+=1
   # score rewards reliability and low latency; it is intentionally bounded 0..100
   reliability=p['successes']/max(1,p['successes']+p['failures']); speed=max(0,100-min(100,p['latency']/10))
@@ -168,6 +173,14 @@ class API(BaseHTTPRequestHandler):
    task={'name':name.strip(),'url':url.strip(),'enabled':1,'status':'idle','runs':0,'successes':0,'created':time.time()}
    with db() as c: cur=c.execute('INSERT INTO tasks(name,url,enabled,status,runs,successes,created) VALUES(?,?,?,?,?,?,?)',(task['name'],task['url'],1,'idle',0,0,task['created'])); task['id']=cur.lastrowid
    state['tasks'].insert(0,task); log('info',f"تم إنشاء المهمة: {task['name']}"); return send(self,200,task)
+  if path=='/api/tasks/create-ip-check':
+   with LOCK:
+    existing=next((task for task in state['tasks'] if task.get('url')==IP_CHECK_URL),None)
+    if existing: return send(self,200,existing)
+    task={'name':'فحص عنوان IP عبر BrowserLeaks','url':IP_CHECK_URL,'enabled':1,'status':'idle','runs':0,'successes':0,'created':time.time()}
+    with db() as c: task['id']=c.execute('INSERT INTO tasks(name,url,enabled,status,runs,successes,created) VALUES(?,?,?,?,?,?,?)',(task['name'],task['url'],1,'idle',0,0,task['created'])).lastrowid
+    state['tasks'].insert(0,task)
+   log('info','تمت إضافة مهمة فحص عنوان IP عبر BrowserLeaks'); return send(self,200,task)
   if path=='/api/tasks/toggle':
    with db() as c: updated=c.execute('UPDATE tasks SET enabled=1-enabled WHERE id=? AND status!="running"',(data.get('id'),)).rowcount
    if not updated: return send(self,409,{'error':'لا يمكن تعديل مهمة قيد التنفيذ أو غير موجودة'})
@@ -188,6 +201,8 @@ class API(BaseHTTPRequestHandler):
    if 'timeout' in data and (not isinstance(data['timeout'],(int,float)) or not 1<=data['timeout']<=120): return send(self,400,{'error':'المهلة يجب أن تكون بين 1 و120 ثانية'})
    if 'retries' in data and (not isinstance(data['retries'],int) or not 0<=data['retries']<=10): return send(self,400,{'error':'عدد المحاولات يجب أن يكون رقماً صحيحاً بين 0 و10'})
    if 'verify' in data and not isinstance(data['verify'],bool): return send(self,400,{'error':'قيمة التحقق يجب أن تكون منطقية'})
+   if 'webrtc_protection' in data and not isinstance(data['webrtc_protection'],bool): return send(self,400,{'error':'قيمة حماية WebRTC يجب أن تكون منطقية'})
+   if 'webrtc_mode' in data and data['webrtc_mode'] not in ('blocked','proxy_only'): return send(self,400,{'error':'وضع WebRTC غير صالح'})
    with LOCK:
     for k,v in data.items():
      if k in state['settings']: state['settings'][k]=v
